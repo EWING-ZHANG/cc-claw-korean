@@ -1,23 +1,32 @@
-#![allow(dead_code, unused_imports, unused_variables, clippy::unneeded_struct_pattern, clippy::unnecessary_wraps, clippy::unused_self)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    clippy::unneeded_struct_pattern,
+    clippy::unnecessary_wraps,
+    clippy::unused_self
+)]
 mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    detect_provider_kind, max_tokens_for_model, resolve_model_alias, resolve_startup_auth_source,
+    AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
@@ -28,7 +37,10 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
-use plugins::{PluginManager, PluginManagerConfig};
+use plugins::{
+    load_plugin_from_directory, PluginManager, PluginManagerConfig, PluginRegistry, PluginTool,
+    PluginToolDefinition, PluginToolPermission,
+};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
@@ -38,23 +50,22 @@ use runtime::{
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
     RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
+use serde::Deserialize;
 use serde_json::json;
 use tools::GlobalToolRegistry;
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
-fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
-}
+const DEFAULT_OPENAI_COMPAT_MODEL: &str = "qwen3-coder-next";
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const CODEX_DELEGATE_TOOL_NAME: &str = "codex_delegate";
+const CODEX_REVIEW_TOOL_NAME: &str = "codex_review";
+const INTERNAL_CODEX_DELEGATE_COMMAND: &str = "__internal_codex_delegate__";
+const INTERNAL_CODEX_REVIEW_COMMAND: &str = "__internal_codex_review__";
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
@@ -76,6 +87,65 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
 ];
 
 type AllowedToolSet = BTreeSet<String>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AvailableCodexIntegration {
+    plugin_id: String,
+    plugin_name: String,
+    companion_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct CodexDelegateToolInput {
+    #[serde(alias = "task")]
+    prompt: String,
+    #[serde(default = "default_true")]
+    write: bool,
+    #[serde(default, alias = "resumeLast")]
+    resume_last: bool,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+struct CodexReviewToolInput {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    focus: Option<String>,
+    #[serde(default)]
+    adversarial: bool,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn env_var_non_empty(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn default_model() -> String {
+    if let Some(model) =
+        env_var_non_empty("OPENAI_MODEL").or_else(|| env_var_non_empty("ANTHROPIC_MODEL"))
+    {
+        return resolve_model_alias(&model);
+    }
+
+    if env_var_non_empty("OPENAI_API_KEY").is_some()
+        || env_var_non_empty("OPENAI_BASE_URL").is_some()
+    {
+        return DEFAULT_OPENAI_COMPAT_MODEL.to_string();
+    }
+
+    DEFAULT_MODEL.to_string()
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -100,6 +170,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::Agents { args } => LiveCli::print_agents(args.as_deref())?,
         CliAction::Skills { args } => LiveCli::print_skills(args.as_deref())?,
+        CliAction::Plugins { action, target } => {
+            run_plugins_command(action.as_deref(), target.as_deref())?
+        }
+        CliAction::ExternalSlashCommand { input } => {
+            run_external_slash_command_and_print(&env::current_dir()?, &input)?
+        }
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Version => print_version(),
         CliAction::ResumeSession {
@@ -141,6 +217,13 @@ enum CliAction {
     },
     Skills {
         args: Option<String>,
+    },
+    Plugins {
+        action: Option<String>,
+        target: Option<String>,
+    },
+    ExternalSlashCommand {
+        input: String,
     },
     PrintSystemPrompt {
         cwd: PathBuf,
@@ -195,7 +278,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = default_model();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
     let mut wants_help = false;
@@ -337,6 +420,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "skills" => Ok(CliAction::Skills {
             args: join_optional_args(&rest[1..]),
         }),
+        "plugin" | "plugins" | "marketplace" => parse_direct_slash_cli_action(
+            &[format!("/{}", rest[0]), rest[1..].join(" ")]
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>(),
+        ),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
@@ -428,7 +517,17 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
         Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help),
         Ok(Some(SlashCommand::Agents { args })) => Ok(CliAction::Agents { args }),
         Ok(Some(SlashCommand::Skills { args })) => Ok(CliAction::Skills { args }),
-        Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
+        Ok(Some(SlashCommand::Plugins { action, target })) => {
+            Ok(CliAction::Plugins { action, target })
+        }
+        Ok(Some(SlashCommand::Unknown(name))) => {
+            let cwd = env::current_dir().map_err(|error| error.to_string())?;
+            if plugin_slash_command_exists(&cwd, &name).map_err(|error| error.to_string())? {
+                Ok(CliAction::ExternalSlashCommand { input: raw })
+            } else {
+                Err(format_unknown_direct_slash_command(&name))
+            }
+        }
         Ok(Some(command)) => Err({
             let _ = command;
             format!(
@@ -551,16 +650,10 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
-fn resolve_model_alias(model: &str) -> &str {
-    match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
-        _ => model,
-    }
-}
-
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
+    if values.is_empty() {
+        return Ok(None);
+    }
     current_tool_registry()?.normalize_allowed_tools(values)
 }
 
@@ -568,11 +661,10 @@ fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
     let cwd = env::current_dir().map_err(|error| error.to_string())?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load().map_err(|error| error.to_string())?;
-    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-    let plugin_tools = plugin_manager
-        .aggregated_tools()
-        .map_err(|error| error.to_string())?;
-    GlobalToolRegistry::with_plugin_tools(plugin_tools)
+    match build_augmented_tool_registry(&cwd, &loader, &runtime_config) {
+        Ok(registry) => Ok(registry),
+        Err(_) => Ok(GlobalToolRegistry::builtin()),
+    }
 }
 
 fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
@@ -854,7 +946,7 @@ fn wait_for_oauth_callback(
 }
 
 fn print_system_prompt(cwd: PathBuf, date: String) {
-    match load_system_prompt(cwd, date, env::consts::OS, "unknown") {
+    match build_system_prompt_for(cwd, &date) {
         Ok(sections) => println!("{}", sections.join("\n\n")),
         Err(error) => {
             eprintln!("failed to build system prompt: {error}");
@@ -1428,6 +1520,12 @@ fn run_repl(
                     break;
                 }
                 match SlashCommand::parse(&trimmed) {
+                    Ok(Some(SlashCommand::Unknown(name))) => {
+                        if cli.handle_unknown_slash_command(&trimmed, &name)? {
+                            cli.persist_session()?;
+                        }
+                        continue;
+                    }
                     Ok(Some(command)) => {
                         if cli.handle_repl_command(command)? {
                             cli.persist_session()?;
@@ -1475,7 +1573,7 @@ struct LiveCli {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
-    runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+    runtime: ConversationRuntime<ProviderRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
 }
 
@@ -1612,14 +1710,37 @@ impl LiveCli {
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(slash_command_completion_candidates_with_sessions(
+        let mut candidates = slash_command_completion_candidates_with_sessions(
             &self.model,
             Some(&self.session.id),
             list_managed_sessions()?
                 .into_iter()
                 .map(|session| session.id)
                 .collect(),
-        ))
+        );
+        candidates.extend(plugin_slash_completion_candidates(&env::current_dir()?));
+        candidates.sort();
+        candidates.dedup();
+        Ok(candidates)
+    }
+
+    fn handle_unknown_slash_command(
+        &mut self,
+        input: &str,
+        name: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if let Some(output) = execute_external_slash_command(&env::current_dir()?, input)? {
+            if !output.is_empty() {
+                print!("{output}");
+                if !output.ends_with('\n') {
+                    println!();
+                }
+            }
+            return Ok(false);
+        }
+
+        eprintln!("{}", format_unknown_slash_command(name));
+        Ok(false)
     }
 
     fn prepare_turn_runtime(
@@ -1627,7 +1748,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<
         (
-            ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+            ConversationRuntime<ProviderRuntimeClient, CliToolExecutor>,
             HookAbortMonitor,
         ),
         Box<dyn std::error::Error>,
@@ -1830,8 +1951,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Unknown(name) => {
-                eprintln!("{}", format_unknown_slash_command(&name));
-                false
+                unreachable!("unknown slash commands are handled earlier: {name}")
             }
         })
     }
@@ -2187,6 +2307,7 @@ impl LiveCli {
     }
 
     fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.system_prompt = build_system_prompt()?;
         self.runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
@@ -3261,13 +3382,19 @@ fn resolve_export_path(
     Ok(cwd.join(final_name))
 }
 
+fn build_system_prompt_for(
+    cwd: PathBuf,
+    current_date: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut sections = load_system_prompt(&cwd, current_date, env::consts::OS, "unknown")?;
+    if available_codex_integration_for(&cwd)?.is_some() {
+        sections.push(codex_delegation_prompt_section());
+    }
+    Ok(sections)
+}
+
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
-        env::current_dir()?,
-        DEFAULT_DATE,
-        env::consts::OS,
-        "unknown",
-    )?)
+    build_system_prompt_for(env::current_dir()?, DEFAULT_DATE)
 }
 
 fn build_runtime_plugin_state(
@@ -3275,8 +3402,7 @@ fn build_runtime_plugin_state(
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;
-    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_manager.aggregated_tools()?)?;
+    let tool_registry = build_augmented_tool_registry(&cwd, &loader, &runtime_config)?;
     Ok((runtime_config.feature_config().clone(), tool_registry))
 }
 
@@ -3313,6 +3439,645 @@ fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
         cwd.join(path)
     } else {
         config_home.join(path)
+    }
+}
+
+fn find_available_codex_integration(
+    registry: &PluginRegistry,
+) -> Option<AvailableCodexIntegration> {
+    registry
+        .plugins()
+        .iter()
+        .filter(|plugin| plugin.is_enabled())
+        .find_map(|plugin| {
+            let metadata = plugin.metadata();
+            if !metadata.name.eq_ignore_ascii_case("codex") {
+                return None;
+            }
+            let root = metadata.root.as_ref()?;
+            let companion_path = root.join("scripts").join("codex-companion.mjs");
+            companion_path.is_file().then(|| AvailableCodexIntegration {
+                plugin_id: metadata.id.clone(),
+                plugin_name: metadata.name.clone(),
+                companion_path,
+            })
+        })
+}
+
+fn available_codex_integration_for(
+    cwd: &Path,
+) -> Result<Option<AvailableCodexIntegration>, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader.load()?;
+    let plugin_manager = build_plugin_manager(cwd, &loader, &runtime_config);
+    let registry = plugin_manager.plugin_registry()?;
+    Ok(find_available_codex_integration(&registry))
+}
+
+fn build_augmented_tool_registry(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<GlobalToolRegistry, Box<dyn std::error::Error>> {
+    let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
+    let registry = plugin_manager.plugin_registry()?;
+    let mut plugin_tools = registry.aggregated_tools()?;
+    if let Some(codex) = find_available_codex_integration(&registry) {
+        plugin_tools.extend(build_internal_codex_tools(&codex));
+    }
+    GlobalToolRegistry::with_plugin_tools(plugin_tools)
+        .map_err(|error| std::io::Error::other(error).into())
+}
+
+fn build_internal_codex_tools(codex: &AvailableCodexIntegration) -> Vec<PluginTool> {
+    vec![
+        PluginTool::new(
+            codex.plugin_id.clone(),
+            codex.plugin_name.clone(),
+            PluginToolDefinition {
+                name: CODEX_DELEGATE_TOOL_NAME.to_string(),
+                description: Some(
+                    "Delegate implementation, debugging, refactoring, or test execution to Codex. Use this after you have scoped or designed the work yourself, and send a self-contained prompt with goals, constraints, target files, and required verification."
+                        .to_string(),
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "prompt": { "type": "string", "minLength": 1 },
+                        "write": { "type": "boolean" },
+                        "resume_last": { "type": "boolean" },
+                        "model": { "type": "string" },
+                        "effort": {
+                            "type": "string",
+                            "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+                        }
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": false
+                }),
+            },
+            INTERNAL_CODEX_DELEGATE_COMMAND.to_string(),
+            Vec::new(),
+            PluginToolPermission::WorkspaceWrite,
+            None,
+        ),
+        PluginTool::new(
+            codex.plugin_id.clone(),
+            codex.plugin_name.clone(),
+            PluginToolDefinition {
+                name: CODEX_REVIEW_TOOL_NAME.to_string(),
+                description: Some(
+                    "Run an independent Codex review of the current working tree or branch. Use this after code changes when you want a second pass before reporting back to the user."
+                        .to_string(),
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["auto", "working-tree", "branch"]
+                        },
+                        "base": { "type": "string" },
+                        "focus": { "type": "string" },
+                        "adversarial": { "type": "boolean" },
+                        "model": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+            INTERNAL_CODEX_REVIEW_COMMAND.to_string(),
+            Vec::new(),
+            PluginToolPermission::ReadOnly,
+            None,
+        ),
+    ]
+}
+
+fn codex_delegation_prompt_section() -> String {
+    [
+        "# Codex delegation".to_string(),
+        " - `codex_delegate` is available when you want Codex to execute implementation, debugging, refactoring, or test work on your behalf.".to_string(),
+        " - If the user asks you to have Codex do the coding, keep yourself as the coordinator: scope or design the change first unless the user explicitly wants Codex to design too.".to_string(),
+        " - When you call `codex_delegate`, send a self-contained prompt that includes the goal, constraints, candidate files, acceptance criteria, and required tests.".to_string(),
+        " - Prefer `write: true` for implementation tasks. Use read-only delegation only when you specifically want investigation without edits.".to_string(),
+        " - `codex_review` is available for an independent review pass after changes when a second set of eyes would help.".to_string(),
+        " - Do not force Codex into every task. Use it when delegation materially helps, and otherwise continue directly with your own tools.".to_string(),
+    ]
+    .join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalSlashCommand {
+    qualified_name: String,
+    plugin_name: String,
+    command_name: String,
+    description: Option<String>,
+    argument_hint: Option<String>,
+    plugin_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PluginCommandFrontmatter {
+    description: Option<String>,
+    argument_hint: Option<String>,
+}
+
+fn run_plugins_command(
+    action: Option<&str>,
+    target: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let result = handle_plugins_slash_command(action, target, &mut manager)?;
+    println!("{}", result.message);
+    Ok(())
+}
+
+fn run_external_slash_command_and_print(
+    cwd: &Path,
+    input: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = execute_external_slash_command(cwd, input)?.ok_or_else(|| {
+        format!(
+            "unknown slash command outside the REPL: {}",
+            input.split_whitespace().next().unwrap_or(input)
+        )
+    })?;
+    if !output.is_empty() {
+        print!("{output}");
+        if !output.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn plugin_slash_command_exists(cwd: &Path, name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(discover_external_slash_commands(cwd)?
+        .iter()
+        .any(|command| command.qualified_name.eq_ignore_ascii_case(name)))
+}
+
+fn plugin_slash_completion_candidates(cwd: &Path) -> Vec<String> {
+    discover_external_slash_commands(cwd)
+        .map(|commands| {
+            commands
+                .into_iter()
+                .map(|command| format!("/{}", command.qualified_name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn execute_external_slash_command(
+    cwd: &Path,
+    input: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some((name, raw_args)) = parse_external_slash_invocation(input) else {
+        return Ok(None);
+    };
+    let commands = discover_external_slash_commands(cwd)?;
+    let Some(command) = commands
+        .into_iter()
+        .find(|command| command.qualified_name.eq_ignore_ascii_case(&name))
+    else {
+        return Ok(None);
+    };
+
+    match command.plugin_name.to_ascii_lowercase().as_str() {
+        "codex" => Ok(Some(execute_codex_plugin_command(cwd, &command, &raw_args)?)),
+        other => Err(format!(
+            "plugin command /{} is installed, but automatic execution is only implemented for Codex-compatible commands right now (found plugin `{other}`)",
+            command.qualified_name
+        )
+        .into()),
+    }
+}
+
+fn discover_external_slash_commands(
+    cwd: &Path,
+) -> Result<Vec<ExternalSlashCommand>, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader.load()?;
+    let manager = build_plugin_manager(cwd, &loader, &runtime_config);
+    let mut commands = Vec::new();
+    let install_root = manager.install_root();
+    let Ok(entries) = fs::read_dir(&install_root) else {
+        return Ok(commands);
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let plugin_root = entry.path();
+        if !plugin_root.is_dir() {
+            continue;
+        }
+        let Ok(manifest) = load_plugin_from_directory(&plugin_root) else {
+            continue;
+        };
+        let commands_dir = plugin_root.join("commands");
+        let Ok(entries) = fs::read_dir(&commands_dir) else {
+            continue;
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file()
+                || !path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            {
+                continue;
+            }
+            let Some(stem) = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+            else {
+                continue;
+            };
+            let frontmatter = parse_plugin_command_frontmatter(&fs::read_to_string(&path)?);
+            let plugin_name = manifest.name.clone();
+            commands.push(ExternalSlashCommand {
+                qualified_name: format!("{plugin_name}:{stem}"),
+                plugin_name,
+                command_name: stem,
+                description: frontmatter.description,
+                argument_hint: frontmatter.argument_hint,
+                plugin_root: plugin_root.clone(),
+            });
+        }
+    }
+
+    commands.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    Ok(commands)
+}
+
+fn parse_plugin_command_frontmatter(contents: &str) -> PluginCommandFrontmatter {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return PluginCommandFrontmatter::default();
+    }
+
+    let mut frontmatter = PluginCommandFrontmatter::default();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("description:") {
+            let value = unquote_plugin_frontmatter_value(value.trim());
+            if !value.is_empty() {
+                frontmatter.description = Some(value);
+            }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("argument-hint:") {
+            let value = unquote_plugin_frontmatter_value(value.trim());
+            if !value.is_empty() {
+                frontmatter.argument_hint = Some(value);
+            }
+        }
+    }
+
+    frontmatter
+}
+
+fn unquote_plugin_frontmatter_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let starts = trimmed.as_bytes()[0];
+        let ends = trimmed.as_bytes()[trimmed.len() - 1];
+        if (starts == b'"' && ends == b'"') || (starts == b'\'' && ends == b'\'') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn parse_external_slash_invocation(input: &str) -> Option<(String, String)> {
+    let trimmed = input.trim();
+    let without_slash = trimmed.strip_prefix('/')?.trim();
+    let mut parts = without_slash.splitn(2, char::is_whitespace);
+    let name = parts.next()?.trim();
+    let args = parts.next().map(str::trim).unwrap_or_default();
+    if name.is_empty() {
+        None
+    } else {
+        Some((name.to_string(), args.to_string()))
+    }
+}
+
+fn tokenize_external_slash_args(args: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if args.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    shlex::split(args)
+        .ok_or_else(|| format!("could not parse slash-command arguments: {args}").into())
+}
+
+fn execute_codex_plugin_command(
+    cwd: &Path,
+    command: &ExternalSlashCommand,
+    raw_args: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let companion = command
+        .plugin_root
+        .join("scripts")
+        .join("codex-companion.mjs");
+    if !companion.is_file() {
+        return Err(format!(
+            "Codex companion script was not found at {}",
+            companion.display()
+        )
+        .into());
+    }
+
+    let mut args = vec![companion.display().to_string()];
+    let background_supported_by_runner = matches!(
+        command.command_name.as_str(),
+        "review" | "adversarial-review"
+    );
+
+    let subcommand = match command.command_name.as_str() {
+        "setup" => "setup",
+        "review" => "review",
+        "adversarial-review" => "adversarial-review",
+        "rescue" => "task",
+        "status" => "status",
+        "result" => "result",
+        "cancel" => "cancel",
+        other => {
+            return Err(format!(
+                "installed Codex command /{} is not supported by this runtime yet ({other})",
+                command.qualified_name
+            )
+            .into());
+        }
+    };
+    args.push(subcommand.to_string());
+
+    let mut command_args = tokenize_external_slash_args(raw_args)?;
+    if command.command_name == "rescue" && !command_args.iter().any(|arg| arg == "--write") {
+        command_args.insert(0, "--write".to_string());
+    }
+    let run_in_background =
+        background_supported_by_runner && command_args.iter().any(|arg| arg == "--background");
+    args.extend(command_args);
+    let node_program = resolve_node_program();
+
+    if run_in_background {
+        spawn_process_detached(&node_program, &args, cwd, "Codex command")?;
+        let label = if command.command_name == "adversarial-review" {
+            "Codex adversarial review"
+        } else {
+            "Codex review"
+        };
+        return Ok(format!(
+            "{label} started in the background. Check /codex:status for progress."
+        ));
+    }
+
+    execute_process_capture(&node_program, &args, cwd, "Codex command")
+}
+
+fn normalize_optional_tool_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn build_codex_delegate_tool_args(
+    companion: &Path,
+    cwd: &Path,
+    input: &CodexDelegateToolInput,
+) -> Result<Vec<String>, ToolError> {
+    let prompt = input.prompt.trim();
+    if prompt.is_empty() {
+        return Err(ToolError::new(
+            "codex_delegate requires a non-empty `prompt`".to_string(),
+        ));
+    }
+
+    let mut args = vec![
+        companion.display().to_string(),
+        "task".to_string(),
+        "--json".to_string(),
+        "--cwd".to_string(),
+        cwd.display().to_string(),
+    ];
+    if input.write {
+        args.push("--write".to_string());
+    }
+    if input.resume_last {
+        args.push("--resume-last".to_string());
+    }
+    if let Some(model) = normalize_optional_tool_text(input.model.as_deref()) {
+        args.push("--model".to_string());
+        args.push(model);
+    }
+    if let Some(effort) = normalize_optional_tool_text(input.effort.as_deref()) {
+        args.push("--effort".to_string());
+        args.push(effort);
+    }
+    args.push(prompt.to_string());
+    Ok(args)
+}
+
+fn build_codex_review_tool_args(
+    companion: &Path,
+    cwd: &Path,
+    input: &CodexReviewToolInput,
+) -> Vec<String> {
+    let focus = normalize_optional_tool_text(input.focus.as_deref());
+    let subcommand = if input.adversarial || focus.is_some() {
+        "adversarial-review"
+    } else {
+        "review"
+    };
+    let mut args = vec![
+        companion.display().to_string(),
+        subcommand.to_string(),
+        "--json".to_string(),
+        "--cwd".to_string(),
+        cwd.display().to_string(),
+    ];
+    if let Some(scope) = normalize_optional_tool_text(input.scope.as_deref()) {
+        args.push("--scope".to_string());
+        args.push(scope);
+    }
+    if let Some(base) = normalize_optional_tool_text(input.base.as_deref()) {
+        args.push("--base".to_string());
+        args.push(base);
+    }
+    if let Some(model) = normalize_optional_tool_text(input.model.as_deref()) {
+        args.push("--model".to_string());
+        args.push(model);
+    }
+    if let Some(focus) = focus {
+        args.push(focus);
+    }
+    args
+}
+
+fn execute_internal_codex_tool(
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Result<Option<String>, ToolError> {
+    if tool_name != CODEX_DELEGATE_TOOL_NAME && tool_name != CODEX_REVIEW_TOOL_NAME {
+        return Ok(None);
+    }
+
+    let cwd = env::current_dir()
+        .map_err(|error| ToolError::new(format!("failed to resolve cwd: {error}")))?;
+    let Some(codex) = available_codex_integration_for(&cwd)
+        .map_err(|error| ToolError::new(format!("failed to resolve Codex integration: {error}")))?
+    else {
+        return Err(ToolError::new(
+            "Codex delegation is unavailable. Install and enable `openai/codex-plugin-cc`, then rerun `/codex:setup`."
+                .to_string(),
+        ));
+    };
+
+    let node_program = resolve_node_program();
+    let output = match tool_name {
+        CODEX_DELEGATE_TOOL_NAME => {
+            let parsed: CodexDelegateToolInput =
+                serde_json::from_value(input.clone()).map_err(|error| {
+                    ToolError::new(format!(
+                        "invalid `{CODEX_DELEGATE_TOOL_NAME}` input: {error}"
+                    ))
+                })?;
+            let args = build_codex_delegate_tool_args(&codex.companion_path, &cwd, &parsed)?;
+            execute_process_capture(&node_program, &args, &cwd, "Codex delegate")
+                .map_err(|error| ToolError::new(error.to_string()))?
+        }
+        CODEX_REVIEW_TOOL_NAME => {
+            let parsed: CodexReviewToolInput =
+                serde_json::from_value(input.clone()).map_err(|error| {
+                    ToolError::new(format!("invalid `{CODEX_REVIEW_TOOL_NAME}` input: {error}"))
+                })?;
+            let args = build_codex_review_tool_args(&codex.companion_path, &cwd, &parsed);
+            execute_process_capture(&node_program, &args, &cwd, "Codex review")
+                .map_err(|error| ToolError::new(error.to_string()))?
+        }
+        _ => unreachable!("unsupported internal Codex tool"),
+    };
+
+    Ok(Some(output))
+}
+
+fn execute_process_capture(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    apply_node_runtime_env(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to start {label} `{program}`: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit status {}", output.status)
+        };
+        Err(format!("{label} failed: {detail}").into())
+    }
+}
+
+fn spawn_process_detached(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_node_runtime_env(&mut command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        command.creation_flags(0x0800_0000);
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to launch {label} in the background: {error}").into())
+}
+
+fn resolve_node_program() -> String {
+    #[cfg(windows)]
+    {
+        let preferred = PathBuf::from(r"C:\Program Files\nodejs\node.exe");
+        if preferred.is_file() {
+            return preferred.display().to_string();
+        }
+    }
+    "node".to_string()
+}
+
+fn apply_node_runtime_env(command: &mut Command) {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        let program_files_node = PathBuf::from(r"C:\Program Files\nodejs");
+        if program_files_node.is_dir() {
+            paths.push(program_files_node);
+        }
+        if let Some(app_data) = env::var_os("APPDATA") {
+            let roaming_npm = PathBuf::from(app_data).join("npm");
+            if roaming_npm.is_dir() {
+                paths.push(roaming_npm);
+            }
+        }
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            let local_npm = PathBuf::from(local_app_data).join("npm");
+            if local_npm.is_dir() {
+                paths.push(local_npm);
+            }
+        }
+    }
+
+    paths.extend(
+        env::var_os("PATH")
+            .into_iter()
+            .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
+            .filter(|path| !path.as_os_str().is_empty()),
+    );
+
+    if paths.is_empty() {
+        return;
+    }
+
+    let mut deduped = Vec::<PathBuf>::new();
+    let mut seen = BTreeSet::<OsString>::new();
+    for path in paths {
+        let key = path.as_os_str().to_os_string();
+        if seen.insert(key) {
+            deduped.push(path);
+        }
+    }
+    if let Ok(joined) = env::join_paths(deduped) {
+        command.env("PATH", joined);
     }
 }
 
@@ -3656,12 +4421,12 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
-) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
+) -> Result<ConversationRuntime<ProviderRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     let (feature_config, tool_registry) = build_runtime_plugin_state()?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
+        ProviderRuntimeClient::new(
             session_id,
             model,
             enable_tools,
@@ -3764,9 +4529,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct AnthropicRuntimeClient {
+struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -3775,7 +4540,7 @@ struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
-impl AnthropicRuntimeClient {
+impl ProviderRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
@@ -3785,10 +4550,14 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let model = resolve_model_alias(&model);
+        let anthropic_auth = match detect_provider_kind(&model) {
+            ProviderKind::Anthropic => Some(resolve_cli_auth_source()?),
+            ProviderKind::Xai | ProviderKind::OpenAi => None,
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
+            client: ProviderClient::from_model_with_anthropic_auth(&model, anthropic_auth)?
                 .with_prompt_cache(PromptCache::new(session_id)),
             model,
             enable_tools,
@@ -3810,7 +4579,7 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     })?)
 }
 
-impl ApiClient for AnthropicRuntimeClient {
+impl ApiClient for ProviderRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
@@ -3844,7 +4613,7 @@ impl ApiClient for AnthropicRuntimeClient {
             let renderer = TerminalRenderer::new();
             let mut markdown_stream = MarkdownStreamState::default();
             let mut events = Vec::new();
-            let mut pending_tool: Option<(String, String, String)> = None;
+            let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
             let mut saw_stop = false;
 
             while let Some(event) = stream
@@ -3854,16 +4623,26 @@ impl ApiClient for AnthropicRuntimeClient {
             {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
-                        for block in start.message.content {
-                            push_output_block(block, out, &mut events, &mut pending_tool, true)?;
+                        for (index, block) in start.message.content.into_iter().enumerate() {
+                            let index =
+                                u32::try_from(index).expect("message start block index overflow");
+                            push_output_block(
+                                block,
+                                index,
+                                out,
+                                &mut events,
+                                &mut pending_tools,
+                                true,
+                            )?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
                         push_output_block(
                             start.content_block,
+                            start.index,
                             out,
                             &mut events,
-                            &mut pending_tool,
+                            &mut pending_tools,
                             true,
                         )?;
                     }
@@ -3882,20 +4661,20 @@ impl ApiClient for AnthropicRuntimeClient {
                             }
                         }
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
-                            if let Some((_, _, input)) = &mut pending_tool {
+                            if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
                                 input.push_str(&partial_json);
                             }
                         }
                         ContentBlockDelta::ThinkingDelta { .. }
                         | ContentBlockDelta::SignatureDelta { .. } => {}
                     },
-                    ApiStreamEvent::ContentBlockStop(_) => {
+                    ApiStreamEvent::ContentBlockStop(stop) => {
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             write!(out, "{rendered}")
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
                         }
-                        if let Some((id, name, input)) = pending_tool.take() {
+                        if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_tool_phase(&name, &input);
                             }
@@ -4535,9 +5314,10 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
 
 fn push_output_block(
     block: OutputContentBlock,
+    block_index: u32,
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
-    pending_tool: &mut Option<(String, String, String)>,
+    pending_tools: &mut BTreeMap<u32, (String, String, String)>,
     streaming_tool_input: bool,
 ) -> Result<(), RuntimeError> {
     match block {
@@ -4562,7 +5342,7 @@ fn push_output_block(
             } else {
                 input.to_string()
             };
-            *pending_tool = Some((id, name, initial_input));
+            pending_tools.insert(block_index, (id, name, initial_input));
         }
         OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
     }
@@ -4574,11 +5354,12 @@ fn response_to_events(
     out: &mut (impl Write + ?Sized),
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
-    let mut pending_tool = None;
+    let mut pending_tools = BTreeMap::new();
 
-    for block in response.content {
-        push_output_block(block, out, &mut events, &mut pending_tool, false)?;
-        if let Some((id, name, input)) = pending_tool.take() {
+    for (index, block) in response.content.into_iter().enumerate() {
+        let index = u32::try_from(index).expect("response block index overflow");
+        push_output_block(block, index, out, &mut events, &mut pending_tools, false)?;
+        if let Some((id, name, input)) = pending_tools.remove(&index) {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
     }
@@ -4588,7 +5369,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -4644,7 +5425,12 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        match self.tool_registry.execute(tool_name, &value) {
+        let execution = if let Some(output) = execute_internal_codex_tool(tool_name, &value)? {
+            Ok(output)
+        } else {
+            self.tool_registry.execute(tool_name, &value)
+        };
+        match execution {
             Ok(output) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
@@ -4847,13 +5633,14 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_cost_report, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        build_codex_delegate_tool_args, build_codex_review_tool_args, build_internal_codex_tools,
+        codex_delegation_prompt_section, create_managed_session_handle, describe_tool_progress,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_cost_report,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, normalize_permission_mode, parse_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         permission_policy, print_help_to, push_output_block, render_config_report,
@@ -4861,8 +5648,10 @@ mod tests {
         resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        CliAction, CliOutputFormat, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        AvailableCodexIntegration, CliAction, CliOutputFormat, CodexDelegateToolInput,
+        CodexReviewToolInput, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, CODEX_DELEGATE_TOOL_NAME,
+        CODEX_REVIEW_TOOL_NAME, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
@@ -4870,6 +5659,7 @@ mod tests {
         AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode, Session,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -5013,6 +5803,7 @@ mod tests {
         assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
         assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
         assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
+        assert_eq!(resolve_model_alias("qwen-coder"), "qwen3-coder-next");
         assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
     }
 
@@ -5340,6 +6131,79 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"bash".to_string()));
         assert!(names.contains(&"plugin_echo".to_string()));
+    }
+
+    #[test]
+    fn internal_codex_tools_include_delegate_and_review() {
+        let codex = AvailableCodexIntegration {
+            plugin_id: "codex@external".to_string(),
+            plugin_name: "codex".to_string(),
+            companion_path: PathBuf::from("C:/temp/codex-companion.mjs"),
+        };
+
+        let tools = build_internal_codex_tools(&codex);
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].definition().name, CODEX_DELEGATE_TOOL_NAME);
+        assert_eq!(tools[0].required_permission(), "workspace-write");
+        assert_eq!(tools[1].definition().name, CODEX_REVIEW_TOOL_NAME);
+        assert_eq!(tools[1].required_permission(), "read-only");
+    }
+
+    #[test]
+    fn codex_delegate_tool_args_default_to_write_mode() {
+        let args = build_codex_delegate_tool_args(
+            Path::new("C:/plugins/codex/scripts/codex-companion.mjs"),
+            Path::new("C:/workspace/project"),
+            &CodexDelegateToolInput {
+                prompt: "Implement the new flow".to_string(),
+                write: true,
+                resume_last: false,
+                model: Some("gpt-5.4".to_string()),
+                effort: Some("high".to_string()),
+            },
+        )
+        .expect("delegate args should build");
+
+        assert_eq!(args[0], "C:/plugins/codex/scripts/codex-companion.mjs");
+        assert_eq!(args[1], "task");
+        assert!(args.contains(&"--json".to_string()));
+        assert!(args.contains(&"--write".to_string()));
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"gpt-5.4".to_string()));
+        assert!(args.contains(&"--effort".to_string()));
+        assert!(args.contains(&"high".to_string()));
+        assert_eq!(args.last().expect("prompt"), "Implement the new flow");
+    }
+
+    #[test]
+    fn codex_review_tool_args_switch_to_adversarial_with_focus() {
+        let args = build_codex_review_tool_args(
+            Path::new("C:/plugins/codex/scripts/codex-companion.mjs"),
+            Path::new("C:/workspace/project"),
+            &CodexReviewToolInput {
+                scope: Some("branch".to_string()),
+                base: Some("main".to_string()),
+                focus: Some("Look for auth regressions".to_string()),
+                adversarial: false,
+                model: None,
+            },
+        );
+
+        assert_eq!(args[1], "adversarial-review");
+        assert!(args.contains(&"--scope".to_string()));
+        assert!(args.contains(&"branch".to_string()));
+        assert!(args.contains(&"--base".to_string()));
+        assert!(args.contains(&"main".to_string()));
+        assert_eq!(args.last().expect("focus"), "Look for auth regressions");
+    }
+
+    #[test]
+    fn codex_prompt_section_mentions_automatic_tools() {
+        let section = codex_delegation_prompt_section();
+        assert!(section.contains(CODEX_DELEGATE_TOOL_NAME));
+        assert!(section.contains(CODEX_REVIEW_TOOL_NAME));
+        assert!(section.contains("delegate"));
     }
 
     #[test]
@@ -6232,15 +7096,16 @@ UU conflicted.rs",
     fn push_output_block_renders_markdown_text() {
         let mut out = Vec::new();
         let mut events = Vec::new();
-        let mut pending_tool = None;
+        let mut pending_tools = BTreeMap::new();
 
         push_output_block(
             OutputContentBlock::Text {
                 text: "# Heading".to_string(),
             },
+            0,
             &mut out,
             &mut events,
-            &mut pending_tool,
+            &mut pending_tools,
             false,
         )
         .expect("text block should render");
@@ -6254,7 +7119,7 @@ UU conflicted.rs",
     fn push_output_block_skips_empty_object_prefix_for_tool_streams() {
         let mut out = Vec::new();
         let mut events = Vec::new();
-        let mut pending_tool = None;
+        let mut pending_tools = BTreeMap::new();
 
         push_output_block(
             OutputContentBlock::ToolUse {
@@ -6262,17 +7127,18 @@ UU conflicted.rs",
                 name: "read_file".to_string(),
                 input: json!({}),
             },
+            0,
             &mut out,
             &mut events,
-            &mut pending_tool,
+            &mut pending_tools,
             true,
         )
         .expect("tool block should accumulate");
 
         assert!(events.is_empty());
         assert_eq!(
-            pending_tool,
-            Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
+            pending_tools.get(&0),
+            Some(&("tool-1".to_string(), "read_file".to_string(), String::new(),))
         );
     }
 

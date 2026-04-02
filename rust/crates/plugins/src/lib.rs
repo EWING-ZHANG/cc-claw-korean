@@ -238,6 +238,18 @@ struct RawPluginManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MarketplaceManifest {
+    #[serde(default)]
+    pub plugins: Vec<MarketplacePluginEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MarketplacePluginEntry {
+    pub name: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RawPluginToolManifest {
     pub name: String,
     pub description: String,
@@ -1105,7 +1117,8 @@ impl PluginManager {
 
     pub fn validate_plugin_source(&self, source: &str) -> Result<PluginManifest, PluginError> {
         let path = resolve_local_source(source)?;
-        load_plugin_from_directory(&path)
+        let plugin_root = resolve_plugin_install_root(&path)?;
+        load_plugin_from_directory(&plugin_root)
     }
 
     pub fn install(&mut self, source: &str) -> Result<InstallOutcome, PluginError> {
@@ -1113,14 +1126,15 @@ impl PluginManager {
         let temp_root = self.install_root().join(".tmp");
         let staged_source = materialize_source(&install_source, &temp_root)?;
         let cleanup_source = matches!(install_source, PluginInstallSource::GitUrl { .. });
-        let manifest = load_plugin_from_directory(&staged_source)?;
+        let plugin_root = resolve_plugin_install_root(&staged_source)?;
+        let manifest = load_plugin_from_directory(&plugin_root)?;
 
         let plugin_id = plugin_id(&manifest.name, EXTERNAL_MARKETPLACE);
         let install_path = self.install_root().join(sanitize_plugin_id(&plugin_id));
         if install_path.exists() {
             fs::remove_dir_all(&install_path)?;
         }
-        copy_dir_all(&staged_source, &install_path)?;
+        copy_dir_all(&plugin_root, &install_path)?;
         if cleanup_source {
             let _ = fs::remove_dir_all(&staged_source);
         }
@@ -1198,12 +1212,13 @@ impl PluginManager {
         let temp_root = self.install_root().join(".tmp");
         let staged_source = materialize_source(&record.source, &temp_root)?;
         let cleanup_source = matches!(record.source, PluginInstallSource::GitUrl { .. });
-        let manifest = load_plugin_from_directory(&staged_source)?;
+        let plugin_root = resolve_plugin_install_root(&staged_source)?;
+        let manifest = load_plugin_from_directory(&plugin_root)?;
 
         if record.install_path.exists() {
             fs::remove_dir_all(&record.install_path)?;
         }
-        copy_dir_all(&staged_source, &record.install_path)?;
+        copy_dir_all(&plugin_root, &record.install_path)?;
         if cleanup_source {
             let _ = fs::remove_dir_all(&staged_source);
         }
@@ -1582,6 +1597,48 @@ pub fn load_plugin_from_directory(root: &Path) -> Result<PluginManifest, PluginE
 fn load_manifest_from_directory(root: &Path) -> Result<PluginManifest, PluginError> {
     let manifest_path = plugin_manifest_path(root)?;
     load_manifest_from_path(root, &manifest_path)
+}
+
+fn resolve_plugin_install_root(root: &Path) -> Result<PathBuf, PluginError> {
+    if plugin_manifest_path(root).is_ok() {
+        return Ok(root.to_path_buf());
+    }
+
+    let marketplace_path = root.join(".claude-plugin").join("marketplace.json");
+    let contents = fs::read_to_string(&marketplace_path).map_err(|error| {
+        PluginError::NotFound(format!(
+            "plugin manifest not found at {} or {}; marketplace manifest lookup at {} failed: {error}",
+            root.join(MANIFEST_FILE_NAME).display(),
+            root.join(MANIFEST_RELATIVE_PATH).display(),
+            marketplace_path.display()
+        ))
+    })?;
+    let marketplace: MarketplaceManifest = serde_json::from_str(&contents)?;
+    let plugin = match marketplace.plugins.as_slice() {
+        [] => {
+            return Err(PluginError::InvalidManifest(format!(
+                "marketplace manifest {} does not define any plugins",
+                marketplace_path.display()
+            )));
+        }
+        [plugin] => plugin,
+        _ => {
+            return Err(PluginError::InvalidManifest(format!(
+                "marketplace manifest {} defines multiple plugins; install a specific plugin directory instead",
+                marketplace_path.display()
+            )));
+        }
+    };
+
+    let plugin_root = root.join(&plugin.source);
+    if !plugin_root.exists() {
+        return Err(PluginError::NotFound(format!(
+            "marketplace plugin `{}` points to missing path {}",
+            plugin.name,
+            plugin_root.display()
+        )));
+    }
+    plugin_manifest_path(&plugin_root).map(|_| plugin_root)
 }
 
 fn load_manifest_from_path(
@@ -2451,6 +2508,34 @@ mod tests {
         assert_eq!(manifest.name, "packaged-demo");
         assert!(manifest.tools.is_empty());
         assert!(manifest.commands.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_plugin_from_marketplace_repo_root_selects_single_packaged_plugin() {
+        let root = temp_dir("manifest-marketplace");
+        write_file(
+            root.join(".claude-plugin")
+                .join("marketplace.json")
+                .as_path(),
+            r#"{
+  "name": "openai-codex",
+  "plugins": [
+    {"name": "codex", "source": "./plugins/codex"}
+  ]
+}"#,
+        );
+        write_external_plugin(&root.join("plugins").join("codex"), "codex", "1.0.2");
+
+        let plugin_root =
+            resolve_plugin_install_root(&root).expect("marketplace root should resolve");
+        assert!(plugin_root.ends_with(Path::new("plugins").join("codex")));
+
+        let manifest =
+            load_plugin_from_directory(&plugin_root).expect("nested plugin manifest should load");
+        assert_eq!(manifest.name, "codex");
+        assert_eq!(manifest.version, "1.0.2");
 
         let _ = fs::remove_dir_all(root);
     }

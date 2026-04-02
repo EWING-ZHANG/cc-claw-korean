@@ -111,6 +111,33 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         },
     ),
+    (
+        "qwen-coder",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        },
+    ),
+    (
+        "qwen-coder-plus",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        },
+    ),
+    (
+        "qwen-coder-next",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -133,10 +160,25 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi => match *alias {
+                    "qwen-coder" => "qwen3-coder-next",
+                    "qwen-coder-plus" => "qwen3-coder-plus",
+                    "qwen-coder-next" => "qwen3-coder-next",
+                    _ => trimmed,
+                },
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
+}
+
+fn looks_like_openai_compat_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    [
+        "gpt-", "o1", "o3", "o4", "qwen", "qwq", "deepseek", "glm", "chatglm", "kimi", "minimax",
+        "abab", "doubao", "hunyuan", "ernie", "yi-", "baichuan", "step-",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 #[must_use]
@@ -156,6 +198,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+        });
+    }
+    if looks_like_openai_compat_model(&canonical) {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
     None
@@ -197,6 +247,7 @@ mod tests {
         assert_eq!(resolve_model_alias("grok"), "grok-3");
         assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
         assert_eq!(resolve_model_alias("grok-2"), "grok-2");
+        assert_eq!(resolve_model_alias("qwen-coder"), "qwen3-coder-next");
     }
 
     #[test]
@@ -206,6 +257,11 @@ mod tests {
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
         );
+        assert_eq!(
+            detect_provider_kind("qwen3-coder-plus"),
+            ProviderKind::OpenAi
+        );
+        assert_eq!(detect_provider_kind("glm-5"), ProviderKind::OpenAi);
     }
 
     #[test]

@@ -139,6 +139,7 @@ impl SystemPromptBuilder {
         }
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
+        sections.push(get_remote_operations_section());
         sections.push(get_actions_section());
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
@@ -489,6 +490,20 @@ fn get_actions_section() -> String {
     .join("\n")
 }
 
+fn get_remote_operations_section() -> String {
+    let items = prepend_bullets(vec![
+        "When the user asks you to inspect or modify a remote machine, use the `bash` tool to run `ssh`, `scp`, `rsync`, or other shell commands instead of asking the user to execute them manually when you can do so yourself.".to_string(),
+        "If the user sends a bare shell-style command such as `ssh ubuntu@example.com`, treat it as an instruction to carry out that action with the appropriate tool when the intent is clear.".to_string(),
+        "Prefer non-interactive remote commands such as `ssh host \\\"cd /path && command\\\"` so the task can complete end to end inside the same turn.".to_string(),
+        "If remote access would block on an interactive password, MFA challenge, or missing SSH key, explain the blocker plainly and ask for the minimum follow-up needed.".to_string(),
+    ]);
+
+    std::iter::once("# Remote operations".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -744,11 +759,22 @@ mod tests {
         assert!(prompt.contains("# System"));
         assert!(prompt.contains("# Project context"));
         assert!(prompt.contains("# Claude instructions"));
+        assert!(prompt.contains("# Remote operations"));
+        assert!(prompt.contains("ssh"));
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn renders_remote_operations_guidance() {
+        let prompt = SystemPromptBuilder::new().render();
+        assert!(prompt.contains("# Remote operations"));
+        assert!(prompt.contains("bash"));
+        assert!(prompt.contains("ssh"));
+        assert!(prompt.contains("bare shell-style command"));
     }
 
     #[test]
