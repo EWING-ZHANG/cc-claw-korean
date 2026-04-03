@@ -24,6 +24,7 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
+const QIANFAN_ANTHROPIC_BASE_URL: &str = "https://qianfan.baidubce.com/anthropic/coding";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -38,6 +39,9 @@ pub enum AuthSource {
 
 impl AuthSource {
     pub fn from_env() -> Result<Self, ApiError> {
+        if let Some(auth) = qianfan_auth_source_from_env()? {
+            return Ok(auth);
+        }
         let api_key = read_env_non_empty("ANTHROPIC_API_KEY")?;
         let auth_token = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?;
         match (api_key, auth_token) {
@@ -513,6 +517,9 @@ impl AnthropicClient {
 
 impl AuthSource {
     pub fn from_env_or_saved() -> Result<Self, ApiError> {
+        if let Some(auth) = qianfan_auth_source_from_env()? {
+            return Ok(auth);
+        }
         if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
             return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
                 Some(bearer_token) => Ok(Self::ApiKeyAndBearer {
@@ -570,6 +577,9 @@ pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource
 where
     F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
 {
+    if let Some(auth) = qianfan_auth_source_from_env()? {
+        return Ok(auth);
+    }
     if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
         return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
@@ -604,6 +614,86 @@ where
     Ok(AuthSource::from(resolve_saved_oauth_token_set(
         &config, token_set,
     )?))
+}
+
+fn qianfan_auth_source_from_env() -> Result<Option<AuthSource>, ApiError> {
+    if !is_qianfan_base_url(&read_base_url()) {
+        return Ok(None);
+    }
+
+    if let Some(raw) = read_env_non_empty("QIANFAN_API_KEY")? {
+        if let Some(auth) = qianfan_auth_source_from_combined_key(&raw) {
+            return Ok(Some(auth));
+        }
+    }
+
+    if let Some(raw) = read_env_non_empty("QIANFAN_CODING_API_KEY")? {
+        if let Some(auth) = qianfan_auth_source_from_combined_key(&raw) {
+            return Ok(Some(auth));
+        }
+    }
+
+    if let Some(raw) = read_env_non_empty("BAIDU_QIANFAN_API_KEY")? {
+        if let Some(auth) = qianfan_auth_source_from_combined_key(&raw) {
+            return Ok(Some(auth));
+        }
+    }
+
+    if let Some(raw) = read_env_non_empty("BCE_QIANFAN_API_KEY")? {
+        if let Some(auth) = qianfan_auth_source_from_combined_key(&raw) {
+            return Ok(Some(auth));
+        }
+    }
+
+    if let Some(raw) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
+        if let Some(auth) = qianfan_auth_source_from_combined_key(&raw) {
+            return Ok(Some(auth));
+        }
+    }
+
+    if let Some(raw) = read_env_non_empty("ANTHROPIC_API_KEY")? {
+        if let Some(auth) = qianfan_auth_source_from_combined_key(&raw) {
+            return Ok(Some(auth));
+        }
+    }
+
+    let ak = read_env_non_empty("QIANFAN_API_KEY_AK")?;
+    let sk = read_env_non_empty("QIANFAN_API_KEY_SK")?;
+    Ok(match (ak, sk) {
+        (Some(ak), Some(sk)) if !ak.is_empty() && !sk.is_empty() => {
+            Some(qianfan_auth_source_from_ak_sk(ak, sk))
+        }
+        _ => None,
+    })
+}
+
+fn qianfan_auth_source_from_combined_key(raw: &str) -> Option<AuthSource> {
+    let mut parts = raw.splitn(4, '/');
+    let prefix = parts.next()?;
+    let ak = parts.next()?;
+    let sk = parts.next()?;
+    if prefix != "bce-v3" || ak.trim().is_empty() || sk.trim().is_empty() {
+        return None;
+    }
+    Some(AuthSource::BearerToken(raw.trim().to_string()))
+}
+
+fn qianfan_auth_source_from_ak_sk(ak: String, sk: String) -> AuthSource {
+    AuthSource::BearerToken(format!("bce-v3/{ak}/{sk}"))
+}
+
+fn is_qianfan_base_url(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .to_ascii_lowercase()
+        .contains("qianfan.baidubce.com/anthropic/coding")
+        || base_url
+            .trim()
+            .to_ascii_lowercase()
+            .contains("qianfan.baidubce.com")
+        || base_url
+            .trim()
+            .eq_ignore_ascii_case(QIANFAN_ANTHROPIC_BASE_URL)
 }
 
 fn resolve_saved_oauth_token_set(
@@ -851,8 +941,10 @@ mod tests {
 
     use super::{
         now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
-        resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
+        resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet, DEFAULT_BASE_URL,
+        QIANFAN_ANTHROPIC_BASE_URL,
     };
+    use crate::error::ApiError;
     use crate::types::{ContentBlockDelta, MessageRequest};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -879,6 +971,16 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => panic!("cleanup temp dir: {error}"),
         }
+    }
+
+    fn clear_qianfan_env_vars() {
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+        std::env::remove_var("QIANFAN_API_KEY");
+        std::env::remove_var("QIANFAN_CODING_API_KEY");
+        std::env::remove_var("BAIDU_QIANFAN_API_KEY");
+        std::env::remove_var("BCE_QIANFAN_API_KEY");
+        std::env::remove_var("QIANFAN_API_KEY_AK");
+        std::env::remove_var("QIANFAN_API_KEY_SK");
     }
 
     fn sample_oauth_config(token_url: String) -> OAuthConfig {
@@ -915,6 +1017,7 @@ mod tests {
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        clear_qianfan_env_vars();
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
@@ -931,6 +1034,7 @@ mod tests {
     fn read_api_key_requires_non_empty_value() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        clear_qianfan_env_vars();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -947,6 +1051,7 @@ mod tests {
     #[test]
     fn read_api_key_prefers_api_key_env() {
         let _guard = env_lock();
+        clear_qianfan_env_vars();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
         assert_eq!(
@@ -960,6 +1065,7 @@ mod tests {
     #[test]
     fn read_auth_token_reads_auth_token_env() {
         let _guard = env_lock();
+        clear_qianfan_env_vars();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         assert_eq!(super::read_auth_token().as_deref(), Some("auth-token"));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
@@ -980,6 +1086,7 @@ mod tests {
     #[test]
     fn auth_source_from_env_combines_api_key_and_bearer_token() {
         let _guard = env_lock();
+        clear_qianfan_env_vars();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
         std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
         let auth = AuthSource::from_env().expect("env auth");
@@ -990,9 +1097,67 @@ mod tests {
     }
 
     #[test]
+    fn qianfan_auth_source_from_env_uses_combined_key_as_bearer_token() {
+        let _guard = env_lock();
+        clear_qianfan_env_vars();
+        std::env::set_var("ANTHROPIC_BASE_URL", QIANFAN_ANTHROPIC_BASE_URL);
+        std::env::set_var("QIANFAN_API_KEY", "bce-v3/test-ak/test-sk");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let auth = AuthSource::from_env().expect("qianfan env auth");
+        assert_eq!(auth.api_key(), None);
+        assert_eq!(auth.bearer_token(), Some("bce-v3/test-ak/test-sk"));
+
+        std::env::remove_var("QIANFAN_API_KEY");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+
+    #[test]
+    fn qianfan_auth_source_from_env_supports_separate_ak_and_sk() {
+        let _guard = env_lock();
+        clear_qianfan_env_vars();
+        std::env::set_var("ANTHROPIC_BASE_URL", QIANFAN_ANTHROPIC_BASE_URL);
+        std::env::set_var("QIANFAN_API_KEY_AK", "test-ak");
+        std::env::set_var("QIANFAN_API_KEY_SK", "test-sk");
+        std::env::remove_var("QIANFAN_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let auth = AuthSource::from_env().expect("qianfan ak/sk auth");
+        assert_eq!(auth.api_key(), None);
+        assert_eq!(auth.bearer_token(), Some("bce-v3/test-ak/test-sk"));
+
+        std::env::remove_var("QIANFAN_API_KEY_AK");
+        std::env::remove_var("QIANFAN_API_KEY_SK");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+
+    #[test]
+    fn qianfan_auth_source_is_not_activated_for_non_qianfan_base_url() {
+        let _guard = env_lock();
+        clear_qianfan_env_vars();
+        std::env::set_var("ANTHROPIC_BASE_URL", DEFAULT_BASE_URL);
+        std::env::set_var("QIANFAN_API_KEY", "bce-v3/test-ak/test-sk");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let error =
+            AuthSource::from_env().expect_err("non-qianfan base url should not parse qianfan key");
+        assert!(matches!(
+            error,
+            ApiError::Auth(_) | ApiError::MissingCredentials { .. }
+        ));
+
+        std::env::remove_var("QIANFAN_API_KEY");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+
+    #[test]
     fn auth_source_from_saved_oauth_when_env_absent() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        clear_qianfan_env_vars();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1032,6 +1197,7 @@ mod tests {
     fn resolve_saved_oauth_token_refreshes_expired_credentials() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        clear_qianfan_env_vars();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1064,6 +1230,7 @@ mod tests {
     fn resolve_startup_auth_source_uses_saved_oauth_without_loading_config() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        clear_qianfan_env_vars();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1088,6 +1255,7 @@ mod tests {
     fn resolve_startup_auth_source_errors_when_refreshable_token_lacks_config() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        clear_qianfan_env_vars();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1120,6 +1288,7 @@ mod tests {
     fn resolve_saved_oauth_token_preserves_refresh_token_when_refresh_response_omits_it() {
         let _guard = env_lock();
         let config_home = temp_config_home();
+        clear_qianfan_env_vars();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");

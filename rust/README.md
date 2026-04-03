@@ -128,6 +128,8 @@ The helper script accepts `ANTHROPIC_AUTH_TOKEN`, `QIANFAN_API_KEY`, `QIANFAN_CO
 - Base URL: `https://qianfan.baidubce.com/anthropic/coding`
 - Model: `qianfan-code-latest`
 
+Use the full Coding Plan key value as the bearer token, for example `bce-v3/...`, instead of splitting it into separate `AK/SK` headers. This was verified against the live `https://qianfan.baidubce.com/anthropic/coding/v1/messages` endpoint with the current official auth flow.
+
 This matches Baidu's official Coding Plan documentation for Anthropic-compatible tools. According to the current official docs, the Anthropic-compatible base URL is `https://qianfan.baidubce.com/anthropic/coding`, the full messages endpoint is `https://qianfan.baidubce.com/anthropic/coding/v1/messages`, and `qianfan-code-latest` is the recommended default model name. Official docs:
 
 - [Coding Plan](https://cloud.baidu.com/doc/qianfan/s/imlg0beiu)
