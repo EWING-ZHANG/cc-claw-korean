@@ -44,6 +44,28 @@ $env:DASHSCOPE_API_KEY="your-key"
 powershell -ExecutionPolicy Bypass -File .\start-qwen-compatible.ps1 -Release
 ```
 
+### Baidu Qianfan Coding Plan
+
+- Anthropic-compatible base URL:
+  - `https://qianfan.baidubce.com/anthropic/coding`
+- Recommended default model:
+  - `qianfan-code-latest`
+- The CLI now defaults to `qianfan-code-latest` when `ANTHROPIC_BASE_URL` points at the Qianfan Coding Plan Anthropic endpoint and no explicit model is passed.
+- Supported Qianfan model IDs called out in the official docs include:
+  - `qianfan-code-latest`
+  - `kimi-k2.5`
+  - `deepseek-v3.2`
+  - `glm-5`
+  - `minimax-m2.5`
+
+Recommended launch:
+
+```powershell
+cd rust
+$env:QIANFAN_API_KEY="your-key"
+powershell -ExecutionPolicy Bypass -File .\start-qianfan-coding.ps1 -Release
+```
+
 ### Codex plugin + automatic delegation
 
 - `openai/codex-plugin-cc` can be installed directly from the repo root URL.

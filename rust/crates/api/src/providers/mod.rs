@@ -1,3 +1,4 @@
+use std::env;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -112,6 +113,24 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         },
     ),
     (
+        "qianfan-code",
+        ProviderMetadata {
+            provider: ProviderKind::Anthropic,
+            auth_env: "ANTHROPIC_AUTH_TOKEN",
+            base_url_env: "ANTHROPIC_BASE_URL",
+            default_base_url: anthropic::DEFAULT_BASE_URL,
+        },
+    ),
+    (
+        "qianfan-code-latest",
+        ProviderMetadata {
+            provider: ProviderKind::Anthropic,
+            auth_env: "ANTHROPIC_AUTH_TOKEN",
+            base_url_env: "ANTHROPIC_BASE_URL",
+            default_base_url: anthropic::DEFAULT_BASE_URL,
+        },
+    ),
+    (
         "qwen-coder",
         ProviderMetadata {
             provider: ProviderKind::OpenAi,
@@ -152,6 +171,8 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "opus" => "claude-opus-4-6",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5-20251213",
+                    "qianfan-code" => "qianfan-code-latest",
+                    "qianfan-code-latest" => "qianfan-code-latest",
                     _ => trimmed,
                 },
                 ProviderKind::Xai => match *alias {
@@ -171,6 +192,29 @@ pub fn resolve_model_alias(model: &str) -> String {
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
 }
 
+fn env_var_non_empty(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn is_qianfan_anthropic_base_url(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .to_ascii_lowercase()
+        .contains("qianfan.baidubce.com/anthropic/coding")
+}
+
+fn looks_like_qianfan_anthropic_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "qianfan-code"
+            | "qianfan-code-latest"
+            | "kimi-k2.5"
+            | "deepseek-v3.2"
+            | "glm-5"
+            | "minimax-m2.5"
+    )
+}
+
 fn looks_like_openai_compat_model(model: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
     [
@@ -188,6 +232,18 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
             auth_env: "ANTHROPIC_API_KEY",
+            base_url_env: "ANTHROPIC_BASE_URL",
+            default_base_url: anthropic::DEFAULT_BASE_URL,
+        });
+    }
+    if env_var_non_empty("ANTHROPIC_BASE_URL")
+        .as_deref()
+        .is_some_and(is_qianfan_anthropic_base_url)
+        && looks_like_qianfan_anthropic_model(&canonical)
+    {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Anthropic,
+            auth_env: "ANTHROPIC_AUTH_TOKEN",
             base_url_env: "ANTHROPIC_BASE_URL",
             default_base_url: anthropic::DEFAULT_BASE_URL,
         });
@@ -241,6 +297,14 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{detect_provider_kind, max_tokens_for_model, resolve_model_alias, ProviderKind};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
+    }
 
     #[test]
     fn resolves_grok_aliases() {
@@ -248,6 +312,7 @@ mod tests {
         assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
         assert_eq!(resolve_model_alias("grok-2"), "grok-2");
         assert_eq!(resolve_model_alias("qwen-coder"), "qwen3-coder-next");
+        assert_eq!(resolve_model_alias("qianfan-code"), "qianfan-code-latest");
     }
 
     #[test]
@@ -262,6 +327,32 @@ mod tests {
             ProviderKind::OpenAi
         );
         assert_eq!(detect_provider_kind("glm-5"), ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn detects_qianfan_coding_models_as_anthropic_when_qianfan_base_url_is_configured() {
+        let _guard = env_lock();
+        let original_base_url = std::env::var("ANTHROPIC_BASE_URL").ok();
+        std::env::set_var(
+            "ANTHROPIC_BASE_URL",
+            "https://qianfan.baidubce.com/anthropic/coding",
+        );
+
+        assert_eq!(
+            detect_provider_kind("qianfan-code-latest"),
+            ProviderKind::Anthropic
+        );
+        assert_eq!(detect_provider_kind("glm-5"), ProviderKind::Anthropic);
+        assert_eq!(
+            detect_provider_kind("deepseek-v3.2"),
+            ProviderKind::Anthropic
+        );
+
+        if let Some(value) = original_base_url {
+            std::env::set_var("ANTHROPIC_BASE_URL", value);
+        } else {
+            std::env::remove_var("ANTHROPIC_BASE_URL");
+        }
     }
 
     #[test]

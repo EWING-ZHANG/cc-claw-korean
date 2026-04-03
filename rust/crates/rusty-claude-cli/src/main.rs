@@ -56,6 +56,7 @@ use tools::GlobalToolRegistry;
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_OPENAI_COMPAT_MODEL: &str = "qwen3-coder-next";
+const DEFAULT_QIANFAN_ANTHROPIC_MODEL: &str = "qianfan-code-latest";
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -131,6 +132,13 @@ fn env_var_non_empty(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
+fn is_qianfan_anthropic_base_url(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .to_ascii_lowercase()
+        .contains("qianfan.baidubce.com/anthropic/coding")
+}
+
 fn default_model() -> String {
     if let Some(model) =
         env_var_non_empty("OPENAI_MODEL").or_else(|| env_var_non_empty("ANTHROPIC_MODEL"))
@@ -142,6 +150,13 @@ fn default_model() -> String {
         || env_var_non_empty("OPENAI_BASE_URL").is_some()
     {
         return DEFAULT_OPENAI_COMPAT_MODEL.to_string();
+    }
+
+    if env_var_non_empty("ANTHROPIC_BASE_URL")
+        .as_deref()
+        .is_some_and(is_qianfan_anthropic_base_url)
+    {
+        return DEFAULT_QIANFAN_ANTHROPIC_MODEL.to_string();
     }
 
     DEFAULT_MODEL.to_string()
@@ -5833,6 +5848,53 @@ mod tests {
     }
 
     #[test]
+    fn default_model_prefers_qianfan_default_when_qianfan_base_url_is_configured() {
+        let _guard = env_lock();
+        let original_openai_model = std::env::var("OPENAI_MODEL").ok();
+        let original_anthropic_model = std::env::var("ANTHROPIC_MODEL").ok();
+        let original_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let original_openai_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        let original_anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL").ok();
+
+        std::env::remove_var("OPENAI_MODEL");
+        std::env::remove_var("ANTHROPIC_MODEL");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::set_var(
+            "ANTHROPIC_BASE_URL",
+            "https://qianfan.baidubce.com/anthropic/coding",
+        );
+
+        assert_eq!(super::default_model(), "qianfan-code-latest");
+
+        if let Some(value) = original_openai_model {
+            std::env::set_var("OPENAI_MODEL", value);
+        } else {
+            std::env::remove_var("OPENAI_MODEL");
+        }
+        if let Some(value) = original_anthropic_model {
+            std::env::set_var("ANTHROPIC_MODEL", value);
+        } else {
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        if let Some(value) = original_openai_api_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        } else {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        if let Some(value) = original_openai_base_url {
+            std::env::set_var("OPENAI_BASE_URL", value);
+        } else {
+            std::env::remove_var("OPENAI_BASE_URL");
+        }
+        if let Some(value) = original_anthropic_base_url {
+            std::env::set_var("ANTHROPIC_BASE_URL", value);
+        } else {
+            std::env::remove_var("ANTHROPIC_BASE_URL");
+        }
+    }
+
+    #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let args = vec![
             "--allowedTools".to_string(),
@@ -6888,9 +6950,17 @@ UU conflicted.rs",
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let rendered = crate::init::render_init_claude_md(std::path::Path::new("."));
+        let root = temp_workspace("init-rust");
+        fs::create_dir_all(root.join("rust")).expect("rust workspace dir");
+        fs::write(
+            root.join("rust").join("Cargo.toml"),
+            "[workspace]\nmembers = []\n",
+        )
+        .expect("write cargo manifest");
+        let rendered = crate::init::render_init_claude_md(&root);
         assert!(rendered.contains("# CLAUDE.md"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
 
     #[test]

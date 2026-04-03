@@ -40,6 +40,14 @@ export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export OPENAI_MODEL="qwen3-coder-next"
 ```
 
+Or use Baidu Qianfan Coding Plan through its Anthropic-compatible endpoint:
+
+```bash
+export ANTHROPIC_AUTH_TOKEN="your-qianfan-coding-plan-key"
+export ANTHROPIC_BASE_URL="https://qianfan.baidubce.com/anthropic/coding"
+export ANTHROPIC_MODEL="qianfan-code-latest"
+```
+
 Or authenticate via OAuth:
 
 ```bash
@@ -84,11 +92,15 @@ Short names resolve to the latest model versions:
 | `opus` | `claude-opus-4-6` |
 | `sonnet` | `claude-sonnet-4-6` |
 | `haiku` | `claude-haiku-4-5-20251213` |
+| `qianfan-code` | `qianfan-code-latest` |
+| `qianfan-code-latest` | `qianfan-code-latest` |
 | `qwen-coder` | `qwen3-coder-next` |
 | `qwen-coder-plus` | `qwen3-coder-plus` |
 | `qwen-coder-next` | `qwen3-coder-next` |
 
 If `OPENAI_API_KEY` or `OPENAI_BASE_URL` is set and no explicit model is passed, the CLI now defaults to `qwen3-coder-next`.
+
+If `ANTHROPIC_BASE_URL` points to Baidu Qianfan Coding Plan and no explicit model is passed, the CLI now defaults to `qianfan-code-latest`.
 
 ## DashScope Helper Script
 
@@ -102,6 +114,32 @@ The helper script accepts `OPENAI_API_KEY`, `DASHSCOPE_API_KEY`, or `BAILIAN_API
 
 - Base URL: `https://dashscope.aliyuncs.com/compatible-mode/v1`
 - Model: `qwen3-coder-next`
+
+## Qianfan Coding Plan Helper Script
+
+On Windows, you can launch the CLI against Baidu Qianfan Coding Plan with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start-qianfan-coding.ps1 --version
+```
+
+The helper script accepts `ANTHROPIC_AUTH_TOKEN`, `QIANFAN_API_KEY`, `QIANFAN_CODING_API_KEY`, `BAIDU_QIANFAN_API_KEY`, or `BCE_QIANFAN_API_KEY`, maps them to the CLI's Anthropic-compatible provider, and defaults to:
+
+- Base URL: `https://qianfan.baidubce.com/anthropic/coding`
+- Model: `qianfan-code-latest`
+
+This matches Baidu's official Coding Plan documentation for Anthropic-compatible tools. According to the current official docs, the Anthropic-compatible base URL is `https://qianfan.baidubce.com/anthropic/coding`, the full messages endpoint is `https://qianfan.baidubce.com/anthropic/coding/v1/messages`, and `qianfan-code-latest` is the recommended default model name. Official docs:
+
+- [Coding Plan](https://cloud.baidu.com/doc/qianfan/s/imlg0beiu)
+- [Claude Code 接入指南](https://cloud.baidu.com/doc/qianfan/s/0mn2mnemj)
+
+The same official docs also list these currently supported model IDs for Coding Plan configuration:
+
+- `qianfan-code-latest`
+- `kimi-k2.5`
+- `deepseek-v3.2`
+- `glm-5`
+- `minimax-m2.5`
 
 ## Codex Plugin Compatibility
 
