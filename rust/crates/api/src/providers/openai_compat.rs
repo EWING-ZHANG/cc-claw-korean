@@ -702,14 +702,21 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 })),
                 InputContentBlock::ToolResult {
                     tool_use_id,
+                    tool_name,
                     content,
                     is_error,
-                } => Some(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_use_id,
-                    "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
-                })),
+                } => {
+                    let mut payload = json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": flatten_tool_result_content(content),
+                        "is_error": is_error,
+                    });
+                    if let Some(name) = tool_name {
+                        payload["name"] = json!(name);
+                    }
+                    Some(payload)
+                }
                 InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
@@ -962,6 +969,7 @@ mod tests {
                     },
                     InputContentBlock::ToolResult {
                         tool_use_id: "tool_1".to_string(),
+                        tool_name: Some("weather".to_string()),
                         content: vec![ToolResultContentBlock::Json {
                             value: json!({"ok": true}),
                         }],
@@ -982,6 +990,7 @@ mod tests {
         assert_eq!(payload["messages"][0]["role"], json!("system"));
         assert_eq!(payload["messages"][1]["role"], json!("user"));
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
+        assert_eq!(payload["messages"][2]["name"], json!("weather"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
     }

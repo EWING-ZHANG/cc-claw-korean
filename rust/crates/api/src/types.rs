@@ -50,6 +50,7 @@ impl InputMessage {
             role: "user".to_string(),
             content: vec![InputContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
+                tool_name: None,
                 content: vec![ToolResultContentBlock::Text {
                     text: content.into(),
                 }],
@@ -72,6 +73,8 @@ pub enum InputContentBlock {
     },
     ToolResult {
         tool_use_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         content: Vec<ToolResultContentBlock>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,

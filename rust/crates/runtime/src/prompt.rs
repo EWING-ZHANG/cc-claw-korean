@@ -85,6 +85,7 @@ impl ProjectContext {
 pub struct SystemPromptBuilder {
     output_style_name: Option<String>,
     output_style_prompt: Option<String>,
+    model_family: Option<String>,
     os_name: Option<String>,
     os_version: Option<String>,
     append_sections: Vec<String>,
@@ -102,6 +103,12 @@ impl SystemPromptBuilder {
     pub fn with_output_style(mut self, name: impl Into<String>, prompt: impl Into<String>) -> Self {
         self.output_style_name = Some(name.into());
         self.output_style_prompt = Some(prompt.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_family(mut self, model_family: impl Into<String>) -> Self {
+        self.model_family = Some(model_family.into());
         self
     }
 
@@ -172,7 +179,10 @@ impl SystemPromptBuilder {
         );
         let mut lines = vec!["# Environment context".to_string()];
         lines.extend(prepend_bullets(vec![
-            format!("Model family: {FRONTIER_MODEL_NAME}"),
+            format!(
+                "Model family: {}",
+                self.model_family.as_deref().unwrap_or(FRONTIER_MODEL_NAME)
+            ),
             format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
@@ -408,14 +418,27 @@ pub fn load_system_prompt(
     os_name: impl Into<String>,
     os_version: impl Into<String>,
 ) -> Result<Vec<String>, PromptBuildError> {
+    load_system_prompt_with_model(cwd, current_date, os_name, os_version, None)
+}
+
+pub fn load_system_prompt_with_model(
+    cwd: impl Into<PathBuf>,
+    current_date: impl Into<String>,
+    os_name: impl Into<String>,
+    os_version: impl Into<String>,
+    model_family: Option<String>,
+) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let config = ConfigLoader::default_for(&cwd).load()?;
-    Ok(SystemPromptBuilder::new()
+    let mut builder = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_project_context(project_context)
-        .with_runtime_config(config)
-        .build())
+        .with_runtime_config(config);
+    if let Some(model_family) = model_family {
+        builder = builder.with_model_family(model_family);
+    }
+    Ok(builder.build())
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {
@@ -766,6 +789,15 @@ mod tests {
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn renders_explicit_model_family_when_provided() {
+        let prompt = SystemPromptBuilder::new()
+            .with_model_family("qianfan-code-latest")
+            .render();
+        assert!(prompt.contains("Model family: qianfan-code-latest"));
+        assert!(!prompt.contains("Model family: Claude Opus 4.6"));
     }
 
     #[test]

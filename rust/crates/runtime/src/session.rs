@@ -222,6 +222,34 @@ impl Session {
         }
     }
 
+    pub fn trim_incomplete_trailing_turns(&mut self) -> bool {
+        let mut changed = false;
+
+        while self
+            .messages
+            .last()
+            .is_some_and(|message| !message.is_completed_turn_terminal())
+        {
+            let Some(last_user_index) = self
+                .messages
+                .iter()
+                .rposition(|message| message.role == MessageRole::User)
+            else {
+                self.messages.clear();
+                changed = true;
+                break;
+            };
+            self.messages.truncate(last_user_index);
+            changed = true;
+        }
+
+        if changed {
+            self.touch();
+        }
+
+        changed
+    }
+
     pub fn to_json(&self) -> Result<JsonValue, SessionError> {
         let mut object = BTreeMap::new();
         object.insert(
@@ -560,6 +588,14 @@ impl ConversationMessage {
             blocks,
             usage,
         })
+    }
+
+    fn is_completed_turn_terminal(&self) -> bool {
+        self.role == MessageRole::Assistant
+            && !self
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
     }
 }
 
@@ -1028,6 +1064,84 @@ mod tests {
 
         assert_eq!(restored.messages.len(), 2);
         assert_eq!(restored.messages[0], ConversationMessage::user_text("hi"));
+    }
+
+    #[test]
+    fn trims_incomplete_trailing_tool_turns() {
+        let mut session = Session::new();
+        session
+            .push_user_text("complete")
+            .expect("message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }]))
+            .expect("message should append");
+        session
+            .push_user_text("incomplete")
+            .expect("message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "pwd".to_string(),
+                },
+            ]))
+            .expect("message should append");
+        session
+            .push_message(ConversationMessage::tool_result(
+                "tool-1", "bash", "/tmp", false,
+            ))
+            .expect("message should append");
+
+        assert!(session.trim_incomplete_trailing_turns());
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            session.messages[0],
+            ConversationMessage::user_text("complete")
+        );
+        assert_eq!(
+            session.messages[1],
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn trims_nested_incomplete_suffixes_until_session_is_consistent() {
+        let mut session = Session::new();
+        session
+            .push_user_text("complete")
+            .expect("message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }]))
+            .expect("message should append");
+        session
+            .push_user_text("tool request")
+            .expect("message should append");
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "pwd".to_string(),
+                },
+            ]))
+            .expect("message should append");
+        session
+            .push_user_text("new question after broken turn")
+            .expect("message should append");
+
+        assert!(session.trim_incomplete_trailing_turns());
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            session.messages[0],
+            ConversationMessage::user_text("complete")
+        );
     }
 
     #[test]

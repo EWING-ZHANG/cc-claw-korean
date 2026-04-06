@@ -476,9 +476,13 @@ impl AnthropicClient {
             request_builder = request_builder.header(header_name, header_value);
         }
 
-        let request_body = self.request_profile.render_json_body(request)?;
+        let request_body = self.render_request_body(request)?;
         request_builder = request_builder.json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
+    }
+
+    fn render_request_body(&self, request: &MessageRequest) -> Result<Value, serde_json::Error> {
+        self.request_profile.render_json_body(request)
     }
 
     fn record_request_failure(&self, attempt: u32, error: &ApiError) {
@@ -938,6 +942,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use runtime::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
+    use serde_json::json;
 
     use super::{
         now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
@@ -945,7 +950,9 @@ mod tests {
         QIANFAN_ANTHROPIC_BASE_URL,
     };
     use crate::error::ApiError;
-    use crate::types::{ContentBlockDelta, MessageRequest};
+    use crate::types::{
+        ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, ToolResultContentBlock,
+    };
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1331,6 +1338,61 @@ mod tests {
         };
 
         assert!(request.with_streaming().stream);
+    }
+
+    #[test]
+    fn qianfan_request_body_keeps_anthropic_tool_result_shape() {
+        let client = AnthropicClient::from_auth(AuthSource::BearerToken("token".to_string()))
+            .with_base_url(QIANFAN_ANTHROPIC_BASE_URL);
+        let body = client
+            .render_request_body(&MessageRequest {
+                model: "qianfan-code-latest".to_string(),
+                max_tokens: 64,
+                messages: vec![
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::Text {
+                            text: "hello".to_string(),
+                        }],
+                    },
+                    InputMessage {
+                        role: "assistant".to_string(),
+                        content: vec![InputContentBlock::ToolUse {
+                            id: "tool_1".to_string(),
+                            name: "weather".to_string(),
+                            input: json!({"city": "Paris"}),
+                        }],
+                    },
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::ToolResult {
+                            tool_use_id: "tool_1".to_string(),
+                            tool_name: Some("weather".to_string()),
+                            content: vec![ToolResultContentBlock::Json {
+                                value: json!({"ok": true}),
+                            }],
+                            is_error: false,
+                        }],
+                    },
+                ],
+                system: Some("be helpful".to_string()),
+                tools: None,
+                tool_choice: None,
+                stream: false,
+            })
+            .expect("body should render");
+
+        assert_eq!(body["messages"][0]["role"], json!("user"));
+        assert_eq!(body["messages"][1]["role"], json!("assistant"));
+        assert_eq!(body["messages"][2]["role"], json!("user"));
+        assert_eq!(
+            body["messages"][2]["content"][0]["type"],
+            json!("tool_result")
+        );
+        assert_eq!(
+            body["messages"][2]["content"][0]["tool_use_id"],
+            json!("tool_1")
+        );
     }
 
     #[test]

@@ -1993,11 +1993,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,
+                        tool_name,
                         output,
                         is_error,
                         ..
                     } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
+                        tool_name: Some(tool_name.clone()),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],

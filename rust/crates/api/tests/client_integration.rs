@@ -809,6 +809,7 @@ fn sample_request(stream: bool) -> MessageRequest {
                 },
                 InputContentBlock::ToolResult {
                     tool_use_id: "toolu_prev".to_string(),
+                    tool_name: Some("get_weather".to_string()),
                     content: vec![api::ToolResultContentBlock::Json {
                         value: json!({"forecast": "sunny"}),
                     }],

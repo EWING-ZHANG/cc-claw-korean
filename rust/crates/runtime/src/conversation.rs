@@ -288,8 +288,11 @@ where
         user_input: impl Into<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
+        self.recover_incomplete_session_state()?;
         let user_input = user_input.into();
         self.record_turn_started(&user_input);
+        let session_before_turn = self.session.clone();
+        let usage_before_turn = self.usage_tracker.clone();
         self.session
             .push_user_text(user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -305,7 +308,12 @@ where
                 let error = RuntimeError::new(
                     "conversation loop exceeded the maximum number of iterations",
                 );
-                self.record_turn_failed(iterations, &error);
+                let error = self.rollback_failed_turn(
+                    iterations,
+                    error,
+                    &session_before_turn,
+                    &usage_before_turn,
+                );
                 return Err(error);
             }
 
@@ -316,7 +324,12 @@ where
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
                 Err(error) => {
-                    self.record_turn_failed(iterations, &error);
+                    let error = self.rollback_failed_turn(
+                        iterations,
+                        error,
+                        &session_before_turn,
+                        &usage_before_turn,
+                    );
                     return Err(error);
                 }
             };
@@ -324,7 +337,12 @@ where
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
-                        self.record_turn_failed(iterations, &error);
+                        let error = self.rollback_failed_turn(
+                            iterations,
+                            error,
+                            &session_before_turn,
+                            &usage_before_turn,
+                        );
                         return Err(error);
                     }
                 };
@@ -348,9 +366,15 @@ where
                 pending_tool_uses.len(),
             );
 
-            self.session
-                .push_message(assistant_message.clone())
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            if let Err(error) = self.session.push_message(assistant_message.clone()) {
+                let error = self.rollback_failed_turn(
+                    iterations,
+                    RuntimeError::new(error.to_string()),
+                    &session_before_turn,
+                    &usage_before_turn,
+                );
+                return Err(error);
+            }
             assistant_messages.push(assistant_message);
 
             if pending_tool_uses.is_empty() {
@@ -451,9 +475,15 @@ where
                         true,
                     ),
                 };
-                self.session
-                    .push_message(result_message.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                if let Err(error) = self.session.push_message(result_message.clone()) {
+                    let error = self.rollback_failed_turn(
+                        iterations,
+                        RuntimeError::new(error.to_string()),
+                        &session_before_turn,
+                        &usage_before_turn,
+                    );
+                    return Err(error);
+                }
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
             }
@@ -502,6 +532,55 @@ where
     #[must_use]
     pub fn into_session(self) -> Session {
         self.session
+    }
+
+    fn rollback_failed_turn(
+        &mut self,
+        iteration: usize,
+        error: RuntimeError,
+        session_before_turn: &Session,
+        usage_before_turn: &UsageTracker,
+    ) -> RuntimeError {
+        let final_error = match self.restore_turn_state(session_before_turn, usage_before_turn) {
+            Ok(()) => error,
+            Err(rollback_error) => RuntimeError::new(format!(
+                "{} (failed to roll back session state: {})",
+                error, rollback_error
+            )),
+        };
+        self.record_turn_failed(iteration, &final_error);
+        final_error
+    }
+
+    fn restore_turn_state(
+        &mut self,
+        session_before_turn: &Session,
+        usage_before_turn: &UsageTracker,
+    ) -> Result<(), RuntimeError> {
+        self.session = session_before_turn.clone();
+        self.usage_tracker = usage_before_turn.clone();
+
+        if let Some(path) = self.session.persistence_path().map(ToOwned::to_owned) {
+            self.session
+                .save_to_path(&path)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    fn recover_incomplete_session_state(&mut self) -> Result<(), RuntimeError> {
+        if !self.session.trim_incomplete_trailing_turns() {
+            return Ok(());
+        }
+
+        if let Some(path) = self.session.persistence_path().map(ToOwned::to_owned) {
+            self.session
+                .save_to_path(&path)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+
+        Ok(())
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
@@ -1675,5 +1754,137 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+        assert!(runtime.session().messages.is_empty());
+        assert_eq!(runtime.usage().turns(), 0);
+    }
+
+    #[test]
+    fn run_turn_rolls_back_session_after_follow_up_api_errors() {
+        struct ToolThenFailApi {
+            calls: usize,
+        }
+
+        impl ApiClient for ToolThenFailApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "payload".to_string(),
+                        },
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 12,
+                            output_tokens: 3,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
+                        Err(RuntimeError::new("follow-up failed"))
+                    }
+                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                }
+            }
+        }
+
+        let path = temp_session_path("rollback-after-tool-failure");
+        let session = Session::new().with_persistence_path(path.clone());
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ToolThenFailApi { calls: 0 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("hello", None)
+            .expect_err("follow-up API failure should propagate");
+
+        assert_eq!(error.to_string(), "follow-up failed");
+        assert!(runtime.session().messages.is_empty());
+        assert_eq!(runtime.usage().turns(), 0);
+
+        let restored = Session::load_from_path(&path).expect("rolled back session should reload");
+        fs::remove_file(&path).expect("temp session file should be removable");
+        assert!(restored.messages.is_empty());
+    }
+
+    #[test]
+    fn run_turn_trims_incomplete_trailing_tool_turns_before_new_input() {
+        struct InspectingApi {
+            seen_requests: usize,
+        }
+
+        impl ApiClient for InspectingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.seen_requests += 1;
+                assert_eq!(self.seen_requests, 1);
+                assert_eq!(request.messages.len(), 3);
+                assert_eq!(request.messages[0].role, MessageRole::User);
+                assert_eq!(request.messages[1].role, MessageRole::Assistant);
+                assert_eq!(request.messages[2].role, MessageRole::User);
+                match &request.messages[2].blocks[0] {
+                    ContentBlock::Text { text } => assert_eq!(text, "fresh question"),
+                    other => panic!("expected fresh user text, got {other:?}"),
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let path = temp_session_path("trim-incomplete-tail");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session
+            .push_user_text("complete")
+            .expect("message should append");
+        session
+            .push_message(crate::session::ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "done".to_string(),
+                },
+            ]))
+            .expect("message should append");
+        session
+            .push_user_text("broken")
+            .expect("message should append");
+        session
+            .push_message(crate::session::ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "pwd".to_string(),
+                },
+            ]))
+            .expect("message should append");
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            InspectingApi { seen_requests: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("fresh question", None)
+            .expect("turn should succeed after trimming the broken tail");
+
+        let restored = Session::load_from_path(&path).expect("trimmed session should reload");
+        fs::remove_file(&path).expect("temp session file should be removable");
+        assert_eq!(restored.messages.len(), 4);
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert_eq!(restored.messages[1].role, MessageRole::Assistant);
+        assert_eq!(restored.messages[2].role, MessageRole::User);
+        assert_eq!(restored.messages[3].role, MessageRole::Assistant);
     }
 }

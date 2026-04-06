@@ -43,7 +43,7 @@ use plugins::{
 };
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
+    clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt_with_model,
     parse_oauth_callback_request_target, resolve_sandbox_status, save_oauth_credentials, ApiClient,
     ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
@@ -961,7 +961,7 @@ fn wait_for_oauth_callback(
 }
 
 fn print_system_prompt(cwd: PathBuf, date: String) {
-    match build_system_prompt_for(cwd, &date) {
+    match build_system_prompt_for(cwd, &date, &default_model()) {
         Ok(sections) => println!("{}", sections.join("\n\n")),
         Err(error) => {
             eprintln!("failed to build system prompt: {error}");
@@ -1654,7 +1654,7 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
+        let system_prompt = build_system_prompt(&model)?;
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -2038,6 +2038,7 @@ impl LiveCli {
         let previous = self.model.clone();
         let session = self.runtime.session().clone();
         let message_count = session.messages.len();
+        self.system_prompt = build_system_prompt(&model)?;
         self.runtime = build_runtime(
             session,
             &self.session.id,
@@ -2322,7 +2323,7 @@ impl LiveCli {
     }
 
     fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.system_prompt = build_system_prompt()?;
+        self.system_prompt = build_system_prompt(&self.model)?;
         self.runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
@@ -3400,16 +3401,23 @@ fn resolve_export_path(
 fn build_system_prompt_for(
     cwd: PathBuf,
     current_date: &str,
+    model_family: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut sections = load_system_prompt(&cwd, current_date, env::consts::OS, "unknown")?;
+    let mut sections = load_system_prompt_with_model(
+        &cwd,
+        current_date,
+        env::consts::OS,
+        "unknown",
+        Some(model_family.to_string()),
+    )?;
     if available_codex_integration_for(&cwd)?.is_some() {
         sections.push(codex_delegation_prompt_section());
     }
     Ok(sections)
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    build_system_prompt_for(env::current_dir()?, DEFAULT_DATE)
+fn build_system_prompt(model_family: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    build_system_prompt_for(env::current_dir()?, DEFAULT_DATE, model_family)
 }
 
 fn build_runtime_plugin_state(
@@ -5502,11 +5510,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,
+                        tool_name,
                         output,
                         is_error,
                         ..
                     } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
+                        tool_name: Some(tool_name.clone()),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
@@ -5734,6 +5744,51 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn with_default_model_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = env_lock();
+        let original_openai_model = std::env::var("OPENAI_MODEL").ok();
+        let original_anthropic_model = std::env::var("ANTHROPIC_MODEL").ok();
+        let original_openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let original_openai_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        let original_anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL").ok();
+
+        std::env::remove_var("OPENAI_MODEL");
+        std::env::remove_var("ANTHROPIC_MODEL");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+
+        let result = f();
+
+        if let Some(value) = original_openai_model {
+            std::env::set_var("OPENAI_MODEL", value);
+        } else {
+            std::env::remove_var("OPENAI_MODEL");
+        }
+        if let Some(value) = original_anthropic_model {
+            std::env::set_var("ANTHROPIC_MODEL", value);
+        } else {
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        if let Some(value) = original_openai_api_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        } else {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        if let Some(value) = original_openai_base_url {
+            std::env::set_var("OPENAI_BASE_URL", value);
+        } else {
+            std::env::remove_var("OPENAI_BASE_URL");
+        }
+        if let Some(value) = original_anthropic_base_url {
+            std::env::set_var("ANTHROPIC_BASE_URL", value);
+        } else {
+            std::env::remove_var("ANTHROPIC_BASE_URL");
+        }
+
+        result
+    }
+
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
         let previous = std::env::current_dir().expect("cwd should load");
         std::env::set_current_dir(cwd).expect("cwd should change");
@@ -5743,33 +5798,37 @@ mod tests {
     }
     #[test]
     fn defaults_to_repl_when_no_args() {
-        assert_eq!(
-            parse_args(&[]).expect("args should parse"),
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
+        with_default_model_env(|| {
+            assert_eq!(
+                parse_args(&[]).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+        });
     }
 
     #[test]
     fn parses_prompt_subcommand() {
-        let args = vec![
-            "prompt".to_string(),
-            "hello".to_string(),
-            "world".to_string(),
-        ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Prompt {
-                prompt: "hello world".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
+        with_default_model_env(|| {
+            let args = vec![
+                "prompt".to_string(),
+                "hello".to_string(),
+                "world".to_string(),
+            ];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Prompt {
+                    prompt: "hello world".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    output_format: CliOutputFormat::Text,
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+        });
     }
 
     #[test]
@@ -5836,15 +5895,17 @@ mod tests {
 
     #[test]
     fn parses_permission_mode_flag() {
-        let args = vec!["--permission-mode=read-only".to_string()];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: None,
-                permission_mode: PermissionMode::ReadOnly,
-            }
-        );
+        with_default_model_env(|| {
+            let args = vec!["--permission-mode=read-only".to_string()];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::ReadOnly,
+                }
+            );
+        });
     }
 
     #[test]
@@ -5896,24 +5957,26 @@ mod tests {
 
     #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
-        let args = vec![
-            "--allowedTools".to_string(),
-            "read,glob".to_string(),
-            "--allowed-tools=write_file".to_string(),
-        ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: Some(
-                    ["glob_search", "read_file", "write_file"]
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
-                ),
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
+        with_default_model_env(|| {
+            let args = vec![
+                "--allowedTools".to_string(),
+                "read,glob".to_string(),
+                "--allowed-tools=write_file".to_string(),
+            ];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: Some(
+                        ["glob_search", "read_file", "write_file"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect()
+                    ),
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+        });
     }
 
     #[test]
@@ -5974,25 +6037,27 @@ mod tests {
 
     #[test]
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
-        assert_eq!(
-            parse_args(&["help".to_string()]).expect("help should parse"),
-            CliAction::Help
-        );
-        assert_eq!(
-            parse_args(&["version".to_string()]).expect("version should parse"),
-            CliAction::Version
-        );
-        assert_eq!(
-            parse_args(&["status".to_string()]).expect("status should parse"),
-            CliAction::Status {
-                model: DEFAULT_MODEL.to_string(),
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
-        assert_eq!(
-            parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
-            CliAction::Sandbox
-        );
+        with_default_model_env(|| {
+            assert_eq!(
+                parse_args(&["help".to_string()]).expect("help should parse"),
+                CliAction::Help
+            );
+            assert_eq!(
+                parse_args(&["version".to_string()]).expect("version should parse"),
+                CliAction::Version
+            );
+            assert_eq!(
+                parse_args(&["status".to_string()]).expect("status should parse"),
+                CliAction::Status {
+                    model: DEFAULT_MODEL.to_string(),
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+            assert_eq!(
+                parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
+                CliAction::Sandbox
+            );
+        });
     }
 
     #[test]
@@ -6004,17 +6069,19 @@ mod tests {
 
     #[test]
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
-        assert_eq!(
-            parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
-                .expect("prompt shorthand should still work"),
-            CliAction::Prompt {
-                prompt: "help me debug".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
+        with_default_model_env(|| {
+            assert_eq!(
+                parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
+                    .expect("prompt shorthand should still work"),
+                CliAction::Prompt {
+                    prompt: "help me debug".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    output_format: CliOutputFormat::Text,
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+        });
     }
 
     #[test]

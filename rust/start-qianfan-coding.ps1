@@ -10,6 +10,36 @@ param(
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
+function Normalize-QianfanToken {
+    param(
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    $normalized = $Value.Trim()
+    if ($normalized.Length -ge 2) {
+        $first = $normalized.Substring(0, 1)
+        $last = $normalized.Substring($normalized.Length - 1, 1)
+        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+            $normalized = $normalized.Substring(1, $normalized.Length - 2).Trim()
+        }
+    }
+
+    return $normalized
+}
+
+if ([string]::IsNullOrWhiteSpace($env:HOME)) {
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $env:HOME = $env:USERPROFILE
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:HOMEDRIVE) -and -not [string]::IsNullOrWhiteSpace($env:HOMEPATH)) {
+        $env:HOME = "$($env:HOMEDRIVE)$($env:HOMEPATH)"
+    }
+}
+
 $resolvedAuthToken = $AuthToken
 if ([string]::IsNullOrWhiteSpace($resolvedAuthToken)) {
     $resolvedAuthToken = $env:ANTHROPIC_AUTH_TOKEN
@@ -27,8 +57,14 @@ if ([string]::IsNullOrWhiteSpace($resolvedAuthToken)) {
     $resolvedAuthToken = $env:BCE_QIANFAN_API_KEY
 }
 
+$resolvedAuthToken = Normalize-QianfanToken $resolvedAuthToken
+
 if ([string]::IsNullOrWhiteSpace($resolvedAuthToken)) {
     throw "Set ANTHROPIC_AUTH_TOKEN, QIANFAN_API_KEY, QIANFAN_CODING_API_KEY, BAIDU_QIANFAN_API_KEY, or BCE_QIANFAN_API_KEY before running start-qianfan-coding.ps1."
+}
+
+if (-not $resolvedAuthToken.StartsWith("bce-v3/")) {
+    Write-Warning "The provided Qianfan Coding Plan key does not start with 'bce-v3/'. If requests fail with invalid_iam_token, re-copy the dedicated Coding Plan API key from the Baidu console."
 }
 
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue

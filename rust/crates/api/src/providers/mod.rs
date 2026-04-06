@@ -317,6 +317,10 @@ mod tests {
 
     #[test]
     fn detects_provider_from_model_name_first() {
+        let _guard = env_lock();
+        let original_base_url = std::env::var("ANTHROPIC_BASE_URL").ok();
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+
         assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
@@ -327,6 +331,10 @@ mod tests {
             ProviderKind::OpenAi
         );
         assert_eq!(detect_provider_kind("glm-5"), ProviderKind::OpenAi);
+
+        if let Some(value) = original_base_url {
+            std::env::set_var("ANTHROPIC_BASE_URL", value);
+        }
     }
 
     #[test]
